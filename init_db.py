@@ -1,7 +1,7 @@
 """
-Загрузка всех Ethereum-адресов и балансов из BigQuery в SQLite.
-Таблица: bigquery-public-data.crypto_ethereum.balances (~411M строк)
-Используем BigQuery Storage Read API напрямую (gRPC, параллельные потоки).
+Load all Ethereum addresses and balances from BigQuery into SQLite.
+Table: bigquery-public-data.crypto_ethereum.balances (~411M rows)
+Uses BigQuery Storage Read API directly (gRPC, parallel streams).
 """
 
 import sqlite3
@@ -29,19 +29,19 @@ parent = f"projects/{credentials.project_id}"
 session = storage_client.create_read_session(
     parent=parent,
     read_session=read_session,
-    max_stream_count=0,  # сервер выберет оптимальное количество потоков
+    max_stream_count=0,  # server chooses optimal number of streams
 )
 
-print(f"Создано потоков чтения: {len(session.streams)}")
+print(f"Read streams created: {len(session.streams)}")
 
 # --- SQLite ---
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
-cur.execute("PRAGMA page_size=32768")       # большие страницы — меньше I/O
+cur.execute("PRAGMA page_size=32768")       # larger pages = less I/O
 cur.execute("PRAGMA journal_mode=WAL")
 cur.execute("PRAGMA synchronous=OFF")
-cur.execute("PRAGMA temp_store=MEMORY")     # временные данные в RAM (для индекса)
-cur.execute("PRAGMA cache_size=-2000000")   # 2 ГБ кэш
+cur.execute("PRAGMA temp_store=MEMORY")     # temp data in RAM (for index)
+cur.execute("PRAGMA cache_size=-2000000")   # 2 GB cache
 
 cur.execute("DROP TABLE IF EXISTS addresses")
 cur.execute("""
@@ -63,8 +63,8 @@ cur.execute("""
 """)
 conn.commit()
 
-# --- Загрузка ---
-print("Чтение через Storage Read API (gRPC)...")
+# --- Loading ---
+print("Reading via Storage Read API (gRPC)...")
 start = time.time()
 count = 0
 
@@ -83,23 +83,23 @@ for i, stream in enumerate(session.streams):
             conn.commit()
             elapsed = time.time() - start
             speed = count / elapsed if elapsed > 0 else 0
-            print(f"  {count:>12,} адресов  |  поток {i+1}/{len(session.streams)}  |  {elapsed:.0f}с  |  {speed:,.0f} строк/с")
+            print(f"  {count:>12,} addresses  |  stream {i+1}/{len(session.streams)}  |  {elapsed:.0f}s  |  {speed:,.0f} rows/s")
 
 conn.commit()
 
-# --- Индекс ---
+# --- Index ---
 elapsed = time.time() - start
-print(f"\nЗагружено {count:,} адресов за {elapsed:.0f}с")
-print("Создание индекса по address...")
+print(f"\nLoaded {count:,} addresses in {elapsed:.0f}s")
+print("Creating index on address...")
 
 cur.execute("CREATE UNIQUE INDEX idx_address ON addresses(address)")
 conn.commit()
 
 elapsed = time.time() - start
-print(f"Индекс создан. Общее время: {elapsed:.0f}с")
-print(f"БД сохранена: {DB_PATH}")
+print(f"Index created. Total time: {elapsed:.0f}s")
+print(f"Database saved: {DB_PATH}")
 
 total = cur.execute("SELECT COUNT(*) FROM addresses").fetchone()[0]
-print(f"Строк в таблице addresses: {total:,}")
+print(f"Rows in addresses table: {total:,}")
 
 conn.close()

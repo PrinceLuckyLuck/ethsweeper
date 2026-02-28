@@ -1,17 +1,17 @@
 """
-Тесты корректности GPU реализации.
+GPU implementation correctness tests.
 
-Проверяет:
+Checks:
 1. MurmurHash3: GPU vs Python mmh3
 2. Keccak256: GPU vs pycryptodome
 3. secp256k1: GPU pubkey vs coincurve
 4. Full pipeline: GPU address == CPU address
 5. Bloom filter: GPU bloom check vs Python bloom check
 
-Использование:
+Usage:
   python test_gpu_correctness.py
-  python test_gpu_correctness.py --num-keys 100    # количество ключей для теста
-  python test_gpu_correctness.py --test mmh3       # только тест mmh3
+  python test_gpu_correctness.py --num-keys 100    # number of keys to test
+  python test_gpu_correctness.py --test mmh3       # run only mmh3 test
 """
 
 import argparse
@@ -26,7 +26,7 @@ import numpy as np
 try:
     import pyopencl as cl
 except ImportError:
-    print("ОШИБКА: pyopencl не установлен")
+    print("ERROR: pyopencl is not installed")
     sys.exit(1)
 
 import mmh3
@@ -52,9 +52,9 @@ def select_gpu():
     for platform in platforms:
         devices = platform.get_devices(device_type=cl.device_type.CPU)
         if devices:
-            print("ВНИМАНИЕ: GPU не найден, используем CPU OpenCL")
+            print("WARNING: GPU not found, using CPU OpenCL")
             return platform, devices[0]
-    print("ОШИБКА: Нет доступных OpenCL устройств")
+    print("ERROR: No available OpenCL devices")
     sys.exit(1)
 
 
@@ -285,10 +285,10 @@ __kernel void test_secp256k1(
 }
 """
 
-    print("  Компиляция secp256k1 kernel (может занять время)...")
+    print("  Compiling secp256k1 kernel (may take a moment)...")
     t_compile = time.time()
     program = cl.Program(ctx, source).build()
-    print(f"  Компиляция: {time.time() - t_compile:.1f}с")
+    print(f"  Compilation: {time.time() - t_compile:.1f}s")
 
     # Generate random private keys (ensure valid: 1 <= k < n)
     privkeys_bytes = []
@@ -313,7 +313,7 @@ __kernel void test_secp256k1(
                              hostbuf=privkeys_np)
     pubkeys_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=num_tests * 64)
 
-    print(f"  Запуск kernel для {num_tests} ключей...")
+    print(f"  Running kernel for {num_tests} keys...")
     t_run = time.time()
     program.test_secp256k1(queue, (num_tests,), None,
                            privkeys_buf, pubkeys_buf, np.int32(num_tests))
@@ -321,7 +321,7 @@ __kernel void test_secp256k1(
     gpu_pubkeys = np.empty(num_tests * 64, dtype=np.uint8)
     cl.enqueue_copy(queue, gpu_pubkeys, pubkeys_buf)
     queue.finish()
-    print(f"  Kernel выполнен: {time.time() - t_run:.1f}с")
+    print(f"  Kernel finished: {time.time() - t_run:.1f}s")
 
     matches = 0
     first_mismatch = None
@@ -385,7 +385,7 @@ __kernel void test_full_pipeline(
 }
 """
 
-    print("  Компиляция full pipeline kernel...")
+    print("  Compiling full pipeline kernel...")
     program = cl.Program(ctx, source).build()
     print("  OK")
 
@@ -444,7 +444,7 @@ def test_bloom(ctx, queue, device, num_tests=100):
     print(f"{'='*60}")
 
     if not os.path.exists(BLOOM_PATH) or not os.path.exists(META_PATH):
-        print("  SKIP: bloom.bin или bloom_meta.json не найдены")
+        print("  SKIP: bloom.bin or bloom_meta.json not found")
         return True
 
     meta = json.load(open(META_PATH))
@@ -612,10 +612,10 @@ __kernel void test_incremental(
 }
 """
 
-    print("  Компиляция incremental kernel...")
+    print("  Compiling incremental kernel...")
     t_compile = time.time()
     program = cl.Program(ctx, source).build()
-    print(f"  Компиляция: {time.time() - t_compile:.1f}с")
+    print(f"  Compilation: {time.time() - t_compile:.1f}s")
 
     # Generate random base private keys
     privkeys_bytes = []
@@ -646,7 +646,7 @@ __kernel void test_incremental(
     addresses_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=total_addrs * 42)
     out_privkeys_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=total_addrs * 32)
 
-    print(f"  Запуск kernel для {num_tests} базовых ключей x {keys_per_thread} = {total_addrs} адресов...")
+    print(f"  Running kernel for {num_tests} base keys x {keys_per_thread} = {total_addrs} addresses...")
     t_run = time.time()
     program.test_incremental(queue, (num_tests,), None,
                              privkeys_buf, addresses_buf, out_privkeys_buf,
@@ -655,7 +655,7 @@ __kernel void test_incremental(
     gpu_addresses_raw = np.empty(total_addrs * 42, dtype=np.uint8)
     cl.enqueue_copy(queue, gpu_addresses_raw, addresses_buf)
     queue.finish()
-    print(f"  Kernel выполнен: {time.time() - t_run:.1f}с")
+    print(f"  Kernel finished: {time.time() - t_run:.1f}s")
 
     # Compare
     matches = 0
@@ -805,10 +805,10 @@ __kernel void test_batch(
 }
 """
 
-    print("  Компиляция batch kernel...")
+    print("  Compiling batch kernel...")
     t_compile = time.time()
     program = cl.Program(ctx, source).build()
-    print(f"  Компиляция: {time.time() - t_compile:.1f}с")
+    print(f"  Compilation: {time.time() - t_compile:.1f}s")
 
     # Generate random base private keys
     privkeys_bytes = []
@@ -839,7 +839,7 @@ __kernel void test_batch(
     addresses_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=total_addrs * 42)
     out_privkeys_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=total_addrs * 32)
 
-    print(f"  Запуск kernel для {num_tests} базовых ключей x {keys_per_thread} = {total_addrs} адресов...")
+    print(f"  Running kernel for {num_tests} base keys x {keys_per_thread} = {total_addrs} addresses...")
     t_run = time.time()
     program.test_batch(queue, (num_tests,), None,
                        privkeys_buf, addresses_buf, out_privkeys_buf,
@@ -848,7 +848,7 @@ __kernel void test_batch(
     gpu_addresses_raw = np.empty(total_addrs * 42, dtype=np.uint8)
     cl.enqueue_copy(queue, gpu_addresses_raw, addresses_buf)
     queue.finish()
-    print(f"  Kernel выполнен: {time.time() - t_run:.1f}с")
+    print(f"  Kernel finished: {time.time() - t_run:.1f}s")
 
     # Compare
     matches = 0
@@ -887,7 +887,7 @@ def main():
     args = parser.parse_args()
 
     platform, device = select_gpu()
-    print(f"OpenCL устройство: {device.name} ({platform.name})")
+    print(f"OpenCL device: {device.name} ({platform.name})")
 
     ctx = cl.Context([device])
     queue = cl.CommandQueue(ctx)
@@ -920,7 +920,7 @@ def main():
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"  ИТОГО")
+    print(f"  SUMMARY")
     print(f"{'='*60}")
     all_pass = True
     for name, passed in results.items():
@@ -930,9 +930,9 @@ def main():
             all_pass = False
 
     if all_pass:
-        print(f"\n  Все тесты пройдены!")
+        print(f"\n  All tests passed!")
     else:
-        print(f"\n  Есть ошибки! Проверьте реализацию.")
+        print(f"\n  Errors found! Check the implementation.")
     print(f"{'='*60}")
 
     return 0 if all_pass else 1

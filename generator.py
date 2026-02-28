@@ -1,13 +1,13 @@
 """
 Ethereum Wallet Generator + Checker
 
-Генерирует случайные приватные ключи, вычисляет адреса,
-проверяет через Bloom filter + SQLite среди ~411M известных адресов.
+Generates random private keys, computes addresses,
+checks them via Bloom filter + SQLite against ~411M known addresses.
 
-Использование:
-  python generator.py              # запуск с дефолтными настройками (30 workers)
-  python generator.py --workers 16 # указать кол-во workers
-  python generator.py --workers 16 --batch 2000  # batch размер для статистики
+Usage:
+  python generator.py              # run with default settings (30 workers)
+  python generator.py --workers 16 # specify number of workers
+  python generator.py --workers 16 --batch 2000  # batch size for stats
 """
 
 import argparse
@@ -27,7 +27,7 @@ from Crypto.Hash import keccak
 
 
 
-# --- Пути ---
+# --- Paths ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "data", "eth_addresses.db")
 BLOOM_PATH = os.path.join(BASE_DIR, "data", "bloom.bin")
@@ -41,7 +41,7 @@ def load_bloom_meta():
 
 
 def bloom_check(mm, address_bytes, m, k):
-    """Проверяет наличие элемента в Bloom filter через mmap."""
+    """Check if an element exists in the Bloom filter via mmap."""
     for seed in range(k):
         h = mmh3.hash(address_bytes, seed, signed=False) % m
         byte_idx = h >> 3
@@ -52,9 +52,9 @@ def bloom_check(mm, address_bytes, m, k):
 
 
 def generate_eth_address(privkey_bytes):
-    """Генерирует Ethereum адрес из 32 байт приватного ключа."""
+    """Generate an Ethereum address from 32 bytes of a private key."""
     pk = PrivateKey(privkey_bytes)
-    # uncompressed public key (65 bytes: 04 + x + y), берём без префикса 04
+    # uncompressed public key (65 bytes: 04 + x + y), strip the 04 prefix
     pubkey = pk.public_key.format(compressed=False)[1:]
     # keccak256
     h = keccak.new(digest_bits=256)
@@ -64,15 +64,15 @@ def generate_eth_address(privkey_bytes):
 
 
 def save_found(address, private_key_hex, eth_balance, attempt_num, db_path):
-    """Сохраняет найденный адрес в файл и SQLite."""
+    """Save a found address to file and SQLite."""
     timestamp = datetime.now().isoformat()
     line = f"{timestamp} | {address} | {private_key_hex} | balance={eth_balance}\n"
 
-    # Запись в файл
+    # Write to file
     with open(FOUND_FILE, "a") as f:
         f.write(line)
 
-    # Запись в SQLite
+    # Write to SQLite
     try:
         conn = sqlite3.connect(db_path)
         conn.execute(
@@ -83,19 +83,19 @@ def save_found(address, private_key_hex, eth_balance, attempt_num, db_path):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[!] Ошибка записи в SQLite: {e}")
+        print(f"[!] SQLite write error: {e}")
 
 
 def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
            counter, found_counter, stop_event, batch_size):
-    """Worker-процесс: генерирует ключи и проверяет адреса."""
-    # Открываем Bloom filter через mmap (read-only, ОС шарит страницы)
+    """Worker process: generates keys and checks addresses."""
+    # Open Bloom filter via mmap (read-only, OS shares pages)
     fd = os.open(bloom_path, os.O_RDONLY)
     mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
 
-    # SQLite-соединение (read-only)
+    # SQLite connection (read-only)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.execute("PRAGMA cache_size = -100000")  # ~100 МБ кеш на worker
+    conn.execute("PRAGMA cache_size = -100000")  # ~100 MB cache per worker
     cur = conn.cursor()
 
     local_count = 0
@@ -104,17 +104,17 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
     try:
         while not stop_event.is_set():
             for _ in range(batch_size):
-                # 1. Генерация случайного приватного ключа
+                # 1. Generate random private key
                 privkey_bytes = os.urandom(32)
 
-                # 2-3. Вычисление Ethereum адреса
+                # 2-3. Compute Ethereum address
                 address = generate_eth_address(privkey_bytes)
 
-                # 4. Проверка в Bloom filter
+                # 4. Check Bloom filter
                 addr_encoded = address.encode('ascii')
                 if bloom_check(mm, addr_encoded, bloom_m, bloom_k):
                     bloom_hits += 1
-                    # 5. Подтверждение в SQLite
+                    # 5. Confirm in SQLite
                     cur.execute("SELECT eth_balance FROM addresses WHERE address = ?",
                                 (address,))
                     row = cur.fetchone()
@@ -124,10 +124,10 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
                         total_so_far = counter.value + local_count
 
                         print(f"\n{'='*60}")
-                        print(f"[!!!] НАЙДЕН АДРЕС: {address}")
-                        print(f"[!!!] Приватный ключ: {privkey_hex}")
-                        print(f"[!!!] Баланс ETH: {eth_balance}")
-                        print(f"[!!!] Попытка #: {total_so_far}")
+                        print(f"[!!!] ADDRESS FOUND: {address}")
+                        print(f"[!!!] Private key: {privkey_hex}")
+                        print(f"[!!!] ETH balance: {eth_balance}")
+                        print(f"[!!!] Attempt #: {total_so_far}")
                         print(f"{'='*60}\n")
 
                         save_found(address, privkey_hex, eth_balance, total_so_far, db_path)
@@ -137,7 +137,7 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
 
                 local_count += 1
 
-            # Периодически отправляем статистику
+            # Periodically update stats
             with counter.get_lock():
                 counter.value += batch_size
             local_count = 0
@@ -145,7 +145,7 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
     except KeyboardInterrupt:
         pass
     finally:
-        # Отправляем остаток
+        # Send remaining count
         if local_count > 0:
             with counter.get_lock():
                 counter.value += local_count
@@ -168,20 +168,20 @@ def format_number(n):
 def main():
     parser = argparse.ArgumentParser(description="Ethereum Wallet Generator + Checker")
     parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() // 2),
-                        help=f"Кол-во worker процессов (default: {max(1, os.cpu_count() // 2)})")
+                        help=f"Number of worker processes (default: {max(1, os.cpu_count() // 2)})")
     parser.add_argument("--batch", type=int, default=1000,
-                        help="Размер batch для обновления счётчика (default: 1000)")
+                        help="Batch size for counter updates (default: 1000)")
     args = parser.parse_args()
 
-    # Проверка файлов
-    for path, name in [(DB_PATH, "SQLite база"), (BLOOM_PATH, "Bloom filter"),
-                       (META_PATH, "Bloom метаданные")]:
+    # Check required files
+    for path, name in [(DB_PATH, "SQLite database"), (BLOOM_PATH, "Bloom filter"),
+                       (META_PATH, "Bloom metadata")]:
         if not os.path.exists(path):
-            print(f"ОШИБКА: {name} не найден: {path}")
-            print("Сначала запустите bloom_build.py для построения Bloom filter.")
+            print(f"ERROR: {name} not found: {path}")
+            print("Run bloom_build.py first to build the Bloom filter.")
             sys.exit(1)
 
-    # Загрузка метаданных
+    # Load metadata
     meta = load_bloom_meta()
     bloom_m = meta["m"]
     bloom_k = meta["k"]
@@ -189,14 +189,14 @@ def main():
     print("=" * 60)
     print("  Ethereum Wallet Generator + Checker")
     print("=" * 60)
-    print(f"  Адресов в базе:    {meta['n']:,}")
-    print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} МБ "
+    print(f"  Addresses in DB:   {meta['n']:,}")
+    print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB "
           f"(FPR={meta['fpr_actual']:.4%})")
     print(f"  Workers:           {args.workers}")
     print(f"  Batch size:        {args.batch}")
-    print(f"  Найденные адреса:  {FOUND_FILE}")
+    print(f"  Found output:      {FOUND_FILE}")
     print("=" * 60)
-    print("  Нажмите Ctrl+C для остановки")
+    print("  Press Ctrl+C to stop")
     print("=" * 60)
     print()
 
@@ -205,7 +205,7 @@ def main():
     found_counter = multiprocessing.Value('i', 0)  # int
     stop_event = multiprocessing.Event()
 
-    # Запуск workers
+    # Start workers
     workers = []
     for i in range(args.workers):
         p = multiprocessing.Process(
@@ -217,10 +217,10 @@ def main():
         p.start()
         workers.append(p)
 
-    print(f"Запущено {len(workers)} worker-процессов")
+    print(f"Started {len(workers)} worker processes")
     print()
 
-    # Мониторинг
+    # Monitoring
     t0 = time.time()
     prev_count = 0
     prev_time = t0
@@ -241,49 +241,49 @@ def main():
 
             alive = sum(1 for p in workers if p.is_alive())
 
-            print(f"[{elapsed:7.0f}с] Проверено: {format_number(total):>10s} | "
-                  f"Скорость: {rate:>10,.0f} keys/sec ({per_worker:,.0f}/worker) | "
+            print(f"[{elapsed:7.0f}s] Checked: {format_number(total):>10s} | "
+                  f"Speed: {rate:>10,.0f} keys/sec ({per_worker:,.0f}/worker) | "
                   f"Avg: {avg_rate:>10,.0f}/sec | "
-                  f"Найдено: {found} | Workers: {alive}/{args.workers}")
+                  f"Found: {found} | Workers: {alive}/{args.workers}")
 
             prev_count = total
             prev_time = now
 
-            # Проверка что workers живы
+            # Check if workers are alive
             if alive == 0:
-                print("\nВсе workers завершились!")
+                print("\nAll workers have stopped!")
                 break
 
     except KeyboardInterrupt:
-        print("\n\nОстановка...")
+        print("\n\nStopping...")
         stop_event.set()
 
-        # Ждём завершения workers (max 10 сек)
+        # Wait for workers to finish (max 10 sec)
         deadline = time.time() + 10
         for p in workers:
             remaining = max(0.1, deadline - time.time())
             p.join(timeout=remaining)
 
-        # Убиваем зависшие
+        # Kill stuck workers
         for p in workers:
             if p.is_alive():
                 p.terminate()
 
-    # Итоговая статистика
+    # Final stats
     total = counter.value
     found = found_counter.value
     elapsed = time.time() - t0
 
     print()
     print("=" * 60)
-    print("  ИТОГО")
+    print("  SUMMARY")
     print("=" * 60)
-    print(f"  Время:          {elapsed:.1f}с")
-    print(f"  Проверено:      {total:,} ключей")
-    print(f"  Avg скорость:   {total / elapsed:,.0f} keys/sec" if elapsed > 0 else "")
-    print(f"  Найдено:        {found}")
+    print(f"  Time:           {elapsed:.1f}s")
+    print(f"  Checked:        {total:,} keys")
+    print(f"  Avg speed:      {total / elapsed:,.0f} keys/sec" if elapsed > 0 else "")
+    print(f"  Found:          {found}")
     if found > 0:
-        print(f"  Результаты:     {FOUND_FILE}")
+        print(f"  Results:        {FOUND_FILE}")
     print("=" * 60)
 
 

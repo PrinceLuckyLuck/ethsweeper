@@ -1,9 +1,9 @@
 """
-Построение Bloom filter из SQLite базы адресов.
-Читает ~411M адресов, строит bit array и сохраняет в data/bloom.bin + data/bloom_meta.json.
+Build Bloom filter from SQLite address database.
+Reads ~411M addresses, builds a bit array and saves to data/bloom.bin + data/bloom_meta.json.
 
-Параметры:
-  FPR ≈ 1% → m = n * 9.6 bits, k = 7 хеш-функций (mmh3 с разными seed)
+Parameters:
+  FPR ~ 1% -> m = n * 9.6 bits, k = 7 hash functions (mmh3 with different seeds)
 """
 
 import json
@@ -17,7 +17,7 @@ import time
 
 import mmh3
 
-# --- Конфигурация ---
+# --- Configuration ---
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "eth_addresses.db")
 BLOOM_PATH = os.path.join(os.path.dirname(__file__), "data", "bloom.bin")
 META_PATH = os.path.join(os.path.dirname(__file__), "data", "bloom_meta.json")
@@ -27,13 +27,13 @@ BATCH_SIZE = 500_000
 
 
 def compute_bloom_size(n, fpr):
-    """Вычисляет оптимальный размер Bloom filter в битах."""
+    """Compute optimal Bloom filter size in bits."""
     m = -n * math.log(fpr) / (math.log(2) ** 2)
     return int(math.ceil(m))
 
 
 def bloom_add(buf, address_bytes, m, k):
-    """Добавляет элемент в Bloom filter (bytearray buf)."""
+    """Add an element to the Bloom filter (bytearray buf)."""
     for seed in range(k):
         h = mmh3.hash(address_bytes, seed, signed=False) % m
         byte_idx = h >> 3
@@ -42,7 +42,7 @@ def bloom_add(buf, address_bytes, m, k):
 
 
 def bloom_check(buf, address_bytes, m, k):
-    """Проверяет наличие элемента в Bloom filter."""
+    """Check if an element exists in the Bloom filter."""
     for seed in range(k):
         h = mmh3.hash(address_bytes, seed, signed=False) % m
         byte_idx = h >> 3
@@ -54,35 +54,35 @@ def bloom_check(buf, address_bytes, m, k):
 
 def main():
     if not os.path.exists(DB_PATH):
-        print(f"ОШИБКА: База данных не найдена: {DB_PATH}")
+        print(f"ERROR: Database not found: {DB_PATH}")
         sys.exit(1)
 
-    # Подсчёт адресов
-    print("Подключение к SQLite...")
+    # Count addresses
+    print("Connecting to SQLite...")
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.execute("PRAGMA cache_size = -2000000")  # ~2 ГБ кеш
+    conn.execute("PRAGMA cache_size = -2000000")  # ~2 GB cache
     cur = conn.cursor()
 
     cur.execute("SELECT COUNT(*) FROM addresses")
     n = cur.fetchone()[0]
-    print(f"Адресов в базе: {n:,}")
+    print(f"Addresses in database: {n:,}")
 
-    # Вычисление параметров
+    # Compute parameters
     m = compute_bloom_size(n, FPR_TARGET)
     m_bytes = (m + 7) // 8
-    m = m_bytes * 8  # округляем до целого байта
+    m = m_bytes * 8  # round up to whole byte
 
-    print(f"Параметры Bloom filter:")
-    print(f"  m = {m:,} бит ({m_bytes / 1024 / 1024:.1f} МБ)")
-    print(f"  k = {NUM_HASHES} хеш-функций")
-    print(f"  Ожидаемый FPR = {(1 - math.exp(-NUM_HASHES * n / m)) ** NUM_HASHES:.6f}")
+    print(f"Bloom filter parameters:")
+    print(f"  m = {m:,} bits ({m_bytes / 1024 / 1024:.1f} MB)")
+    print(f"  k = {NUM_HASHES} hash functions")
+    print(f"  Expected FPR = {(1 - math.exp(-NUM_HASHES * n / m)) ** NUM_HASHES:.6f}")
 
-    # Создаём файл нужного размера
-    print(f"\nСоздание файла {BLOOM_PATH} ({m_bytes / 1024 / 1024:.1f} МБ)...")
+    # Create file of required size
+    print(f"\nCreating file {BLOOM_PATH} ({m_bytes / 1024 / 1024:.1f} MB)...")
     os.makedirs(os.path.dirname(BLOOM_PATH), exist_ok=True)
 
     with open(BLOOM_PATH, "wb") as f:
-        # Заполняем нулями блоками по 1 МБ
+        # Fill with zeros in 1 MB blocks
         block = b'\x00' * (1024 * 1024)
         full_blocks = m_bytes // len(block)
         remainder = m_bytes % len(block)
@@ -91,8 +91,8 @@ def main():
         if remainder:
             f.write(b'\x00' * remainder)
 
-    # Открываем через mmap для записи
-    print("Заполнение Bloom filter...")
+    # Open via mmap for writing
+    print("Populating Bloom filter...")
     fd = os.open(BLOOM_PATH, os.O_RDWR)
     try:
         mm = mmap.mmap(fd, m_bytes, access=mmap.ACCESS_WRITE)
@@ -118,7 +118,7 @@ def main():
                 rate = count / elapsed
                 pct = count / n * 100
                 print(f"  {count:>12,} / {n:,} ({pct:.1f}%) | {rate:,.0f} addr/sec | "
-                      f"прошло {elapsed:.0f}с")
+                      f"elapsed {elapsed:.0f}s")
                 t_last = now
 
         mm.flush()
@@ -127,10 +127,10 @@ def main():
         os.close(fd)
 
     elapsed = time.time() - t0
-    print(f"\nГотово! Обработано {count:,} адресов за {elapsed:.1f}с ({count/elapsed:,.0f} addr/sec)")
+    print(f"\nDone! Processed {count:,} addresses in {elapsed:.1f}s ({count/elapsed:,.0f} addr/sec)")
 
-    # Верификация: проверяем несколько известных адресов
-    print("\nВерификация...")
+    # Verification: check a few known addresses
+    print("\nVerification...")
     fd = os.open(BLOOM_PATH, os.O_RDONLY)
     try:
         mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
@@ -146,7 +146,7 @@ def main():
             if found:
                 ok += 1
 
-        # Проверяем заведомо несуществующий адрес
+        # Check a known non-existent address
         fake = "0x0000000000000000000000000000000000000000"
         fake_found = bloom_check(mm, fake.encode('ascii'), m, NUM_HASHES)
         print(f"  {fake} (fake): {'FOUND (FP)' if fake_found else 'NOT FOUND (OK)'}")
@@ -155,11 +155,11 @@ def main():
     finally:
         os.close(fd)
 
-    print(f"\nВерификация: {ok}/{len(test_addrs)} известных адресов найдены в Bloom filter")
+    print(f"\nVerification: {ok}/{len(test_addrs)} known addresses found in Bloom filter")
     if ok < len(test_addrs):
-        print("ВНИМАНИЕ: не все адреса найдены! Возможна ошибка в построении.")
+        print("WARNING: not all addresses found! Possible build error.")
 
-    # Сохранение метаданных
+    # Save metadata
     meta = {
         "m": m,
         "m_bytes": m_bytes,
@@ -170,8 +170,8 @@ def main():
     }
     with open(META_PATH, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"Метаданные сохранены: {META_PATH}")
-    print(f"Bloom filter: {BLOOM_PATH} ({os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} МБ)")
+    print(f"Metadata saved: {META_PATH}")
+    print(f"Bloom filter: {BLOOM_PATH} ({os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB)")
 
 
 if __name__ == "__main__":
