@@ -1,0 +1,7 @@
+coincurve==21.0.0
+pycryptodome==3.23.0
+mmh3==5.2.0
+pyopencl==2026.1.2
+numpy==2.4.2
+google-cloud-bigquery-storage==2.36.2
+pyarrow==23.0.1
