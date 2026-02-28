@@ -10,6 +10,8 @@ Usage:
   python gpu_generator.py --global-size 262144     # number of GPU threads
   python gpu_generator.py --keys-per-thread 16     # keys per thread
   python gpu_generator.py --local-size 256         # workgroup size
+  python gpu_generator.py --benchmark              # benchmark mode (no DB required)
+  python gpu_generator.py --benchmark --duration 10 --no-batch  # 10s incremental benchmark
 """
 
 import argparse
@@ -139,36 +141,54 @@ def main():
                         help="Use legacy kernel (full scalar mult for each key)")
     parser.add_argument("--no-batch", action="store_true",
                         help="Use incremental without batch inversion (1 mod_inv per key)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Benchmark mode: empty bloom filter, no DB required, auto-stop")
+    parser.add_argument("--duration", type=int, default=30,
+                        help="Benchmark duration in seconds (default: 30)")
     args = parser.parse_args()
 
-    # Check required files
-    for path, name in [(DB_PATH, "SQLite database"), (BLOOM_PATH, "Bloom filter"),
-                       (META_PATH, "Bloom metadata")]:
-        if not os.path.exists(path):
-            print(f"ERROR: {name} not found: {path}")
-            print("Run bloom_build.py first to build the Bloom filter.")
-            sys.exit(1)
+    if args.benchmark:
+        # Benchmark mode: hardcoded bloom parameters, no files required
+        bloom_m = 3_940_037_112
+        bloom_k = 7
+        bloom_size = (bloom_m + 7) // 8  # ~470 MB
+        meta = {"n": 0, "m": bloom_m, "k": bloom_k, "fpr_actual": 0.0}
+    else:
+        # Check required files
+        for path, name in [(DB_PATH, "SQLite database"), (BLOOM_PATH, "Bloom filter"),
+                           (META_PATH, "Bloom metadata")]:
+            if not os.path.exists(path):
+                print(f"ERROR: {name} not found: {path}")
+                print("Run bloom_build.py first to build the Bloom filter.")
+                sys.exit(1)
 
-    # Load Bloom metadata
-    meta = load_bloom_meta()
-    bloom_m = meta["m"]
-    bloom_k = meta["k"]
+        # Load Bloom metadata
+        meta = load_bloom_meta()
+        bloom_m = meta["m"]
+        bloom_k = meta["k"]
 
     # Select GPU
     platform, device = select_gpu_device()
     vram_bytes = device.global_mem_size
 
     print("=" * 70)
-    print("  GPU Ethereum Wallet Generator + Checker")
+    if args.benchmark:
+        print("  GPU Ethereum Wallet Generator - BENCHMARK MODE")
+    else:
+        print("  GPU Ethereum Wallet Generator + Checker")
     print("=" * 70)
     print(f"  GPU:               {device.name}")
     print(f"  Platform:          {platform.name}")
     print(f"  VRAM:              {format_size(vram_bytes)}")
     print(f"  Max work group:    {device.max_work_group_size}")
     print(f"  Compute units:     {device.max_compute_units}")
-    print(f"  Addresses in DB:   {meta['n']:,}")
-    print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB "
-          f"(FPR={meta['fpr_actual']:.4%})")
+    if args.benchmark:
+        print(f"  Duration:          {args.duration}s")
+        print(f"  Bloom filter:      {format_size(bloom_size)} (random, benchmark)")
+    else:
+        print(f"  Addresses in DB:   {meta['n']:,}")
+        print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB "
+              f"(FPR={meta['fpr_actual']:.4%})")
     print(f"  Global size:       {args.global_size:,}")
     print(f"  Local size:        {args.local_size}")
     print(f"  Keys/thread:       {args.keys_per_thread}")
@@ -189,7 +209,8 @@ def main():
     print("=" * 70)
 
     # VRAM budget
-    bloom_size = os.path.getsize(BLOOM_PATH)
+    if not args.benchmark:
+        bloom_size = os.path.getsize(BLOOM_PATH)
     seeds_size = args.global_size * 4 * 8  # 4 ulongs per thread
     hits_pk_size = MAX_HITS * 32
     hits_addr_size = MAX_HITS * 42
@@ -241,13 +262,25 @@ def main():
     print("Kernel compiled successfully!")
 
     # Load Bloom filter into VRAM
-    print("Loading Bloom filter into VRAM...")
-    with open(BLOOM_PATH, "rb") as f:
-        bloom_data = f.read()
-    bloom_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                          hostbuf=bloom_data)
-    del bloom_data  # Free RAM
-    print(f"Bloom filter loaded into VRAM ({format_size(bloom_size)})")
+    if args.benchmark:
+        print("Creating random Bloom filter in VRAM (benchmark)...")
+        # Random data simulates ~50% bit density (realistic memory access pattern)
+        # Real bloom also has ~50% bits set. This gives realistic bloom check cost
+        # and ~1% false positive rate (same as real filter).
+        rng = np.random.default_rng(42)
+        bloom_data = rng.integers(0, 256, size=bloom_size, dtype=np.uint8)
+        bloom_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                              hostbuf=bloom_data)
+        del bloom_data
+        print(f"Random Bloom filter created ({format_size(bloom_size)})")
+    else:
+        print("Loading Bloom filter into VRAM...")
+        with open(BLOOM_PATH, "rb") as f:
+            bloom_data = f.read()
+        bloom_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                              hostbuf=bloom_data)
+        del bloom_data  # Free RAM
+        print(f"Bloom filter loaded into VRAM ({format_size(bloom_size)})")
 
     # Create buffers
     seeds_np = np.empty(args.global_size * 4, dtype=np.uint64)
@@ -343,10 +376,16 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    print(f"Starting generation on {device.name}...\n")
+    if args.benchmark:
+        print(f"Starting benchmark on {device.name} ({args.duration}s)...\n")
+    else:
+        print(f"Starting generation on {device.name}...\n")
 
     iteration = 0
     while not stop:
+        # Auto-stop for benchmark
+        if args.benchmark and (time.time() - t0) >= args.duration:
+            break
         iteration += 1
 
         # 1. Generate random seeds on CPU
@@ -386,7 +425,7 @@ def main():
         total_bloom_hits += n_hits
 
         # 6. Process bloom hits: read buffers, launch async SQLite verification
-        if n_hits > 0:
+        if n_hits > 0 and not args.benchmark:
             actual_hits = min(n_hits, MAX_HITS)
 
             # Read hit buffers from GPU (PCIe transfer — must finish before next kernel)
@@ -442,18 +481,24 @@ def main():
     elapsed = time.time() - t0
     print()
     print("=" * 70)
-    print("  SUMMARY (GPU)")
+    if args.benchmark:
+        print("  BENCHMARK RESULTS (GPU)")
+    else:
+        print("  SUMMARY (GPU)")
     print("=" * 70)
     print(f"  GPU:            {device.name}")
+    if args.benchmark:
+        print(f"  Mode:           {mode}")
     print(f"  Time:           {elapsed:.1f}s")
     print(f"  Checked:        {total_keys:,} keys")
     if elapsed > 0:
         print(f"  Avg speed:      {total_keys / elapsed:,.0f} keys/sec")
-    print(f"  Bloom hits:     {total_bloom_hits:,} ({total_bloom_hits / total_keys * 100:.3f}%)"
-          if total_keys > 0 else "")
-    print(f"  Found:          {total_found}")
-    if total_found > 0:
-        print(f"  Results:        {FOUND_FILE}")
+    if not args.benchmark:
+        print(f"  Bloom hits:     {total_bloom_hits:,} ({total_bloom_hits / total_keys * 100:.3f}%)"
+              if total_keys > 0 else "")
+        print(f"  Found:          {total_found}")
+        if total_found > 0:
+            print(f"  Results:        {FOUND_FILE}")
     print("=" * 70)
 
 

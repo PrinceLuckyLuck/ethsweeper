@@ -8,6 +8,8 @@ Usage:
   python generator.py              # run with default settings (30 workers)
   python generator.py --workers 16 # specify number of workers
   python generator.py --workers 16 --batch 2000  # batch size for stats
+  python generator.py --benchmark              # benchmark mode (no DB required)
+  python generator.py --benchmark --duration 10  # 10s benchmark
 """
 
 import argparse
@@ -18,9 +20,11 @@ import os
 import signal
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime
 
+import numpy as np
 import mmh3
 from coincurve import PrivateKey
 from Crypto.Hash import keccak
@@ -87,16 +91,19 @@ def save_found(address, private_key_hex, eth_balance, attempt_num, db_path):
 
 
 def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
-           counter, found_counter, stop_event, batch_size):
+           counter, found_counter, stop_event, batch_size, benchmark=False):
     """Worker process: generates keys and checks addresses."""
     # Open Bloom filter via mmap (read-only, OS shares pages)
     fd = os.open(bloom_path, os.O_RDONLY)
     mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
 
-    # SQLite connection (read-only)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.execute("PRAGMA cache_size = -100000")  # ~100 MB cache per worker
-    cur = conn.cursor()
+    # SQLite connection (read-only) — skip in benchmark
+    conn = None
+    cur = None
+    if not benchmark:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA cache_size = -100000")  # ~100 MB cache per worker
+        cur = conn.cursor()
 
     local_count = 0
     bloom_hits = 0
@@ -114,26 +121,27 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
                 addr_encoded = address.encode('ascii')
                 if bloom_check(mm, addr_encoded, bloom_m, bloom_k):
                     bloom_hits += 1
-                    # 5. Confirm in SQLite
-                    cur.execute("SELECT eth_balance FROM addresses WHERE address = ?",
-                                (address,))
-                    row = cur.fetchone()
-                    if row is not None:
-                        eth_balance = row[0]
-                        privkey_hex = "0x" + privkey_bytes.hex()
-                        total_so_far = counter.value + local_count
+                    if not benchmark:
+                        # 5. Confirm in SQLite
+                        cur.execute("SELECT eth_balance FROM addresses WHERE address = ?",
+                                    (address,))
+                        row = cur.fetchone()
+                        if row is not None:
+                            eth_balance = row[0]
+                            privkey_hex = "0x" + privkey_bytes.hex()
+                            total_so_far = counter.value + local_count
 
-                        print(f"\n{'='*60}")
-                        print(f"[!!!] ADDRESS FOUND: {address}")
-                        print(f"[!!!] Private key: {privkey_hex}")
-                        print(f"[!!!] ETH balance: {eth_balance}")
-                        print(f"[!!!] Attempt #: {total_so_far}")
-                        print(f"{'='*60}\n")
+                            print(f"\n{'='*60}")
+                            print(f"[!!!] ADDRESS FOUND: {address}")
+                            print(f"[!!!] Private key: {privkey_hex}")
+                            print(f"[!!!] ETH balance: {eth_balance}")
+                            print(f"[!!!] Attempt #: {total_so_far}")
+                            print(f"{'='*60}\n")
 
-                        save_found(address, privkey_hex, eth_balance, total_so_far, db_path)
+                            save_found(address, privkey_hex, eth_balance, total_so_far, db_path)
 
-                        with found_counter.get_lock():
-                            found_counter.value += 1
+                            with found_counter.get_lock():
+                                found_counter.value += 1
 
                 local_count += 1
 
@@ -152,7 +160,8 @@ def worker(worker_id, bloom_path, bloom_m, bloom_k, db_path,
 
         mm.close()
         os.close(fd)
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def format_number(n):
@@ -171,32 +180,72 @@ def main():
                         help=f"Number of worker processes (default: {max(1, os.cpu_count() // 2)})")
     parser.add_argument("--batch", type=int, default=1000,
                         help="Batch size for counter updates (default: 1000)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Benchmark mode: empty bloom filter, no DB required, auto-stop")
+    parser.add_argument("--duration", type=int, default=30,
+                        help="Benchmark duration in seconds (default: 30)")
     args = parser.parse_args()
 
-    # Check required files
-    for path, name in [(DB_PATH, "SQLite database"), (BLOOM_PATH, "Bloom filter"),
-                       (META_PATH, "Bloom metadata")]:
-        if not os.path.exists(path):
-            print(f"ERROR: {name} not found: {path}")
-            print("Run bloom_build.py first to build the Bloom filter.")
-            sys.exit(1)
+    if args.benchmark:
+        # Benchmark mode: hardcoded bloom parameters, no files required
+        bloom_m = 3_940_037_112
+        bloom_k = 7
+        bloom_size = (bloom_m + 7) // 8  # ~470 MB
+        meta = {"n": 0, "m": bloom_m, "k": bloom_k, "fpr_actual": 0.0}
 
-    # Load metadata
-    meta = load_bloom_meta()
-    bloom_m = meta["m"]
-    bloom_k = meta["k"]
+        # Create temporary random bloom file for mmap
+        # Random data simulates ~50% bit density (realistic memory access pattern
+        # and ~1% false positive rate, same as real filter)
+        print("Creating random Bloom filter for benchmark...")
+        benchmark_bloom_fd, benchmark_bloom_path = tempfile.mkstemp(suffix=".bloom")
+        os.close(benchmark_bloom_fd)
+        rng = np.random.default_rng(42)
+        with open(benchmark_bloom_path, "wb") as f:
+            # Write in 1 MB chunks to avoid huge memory allocation
+            remaining = bloom_size
+            while remaining > 0:
+                write_size = min(remaining, 1024 * 1024)
+                f.write(rng.integers(0, 256, size=write_size, dtype=np.uint8).tobytes())
+                remaining -= write_size
+        bloom_path = benchmark_bloom_path
+        print(f"Random Bloom filter created ({bloom_size / 1024 / 1024:.1f} MB)")
+    else:
+        # Check required files
+        for path, name in [(DB_PATH, "SQLite database"), (BLOOM_PATH, "Bloom filter"),
+                           (META_PATH, "Bloom metadata")]:
+            if not os.path.exists(path):
+                print(f"ERROR: {name} not found: {path}")
+                print("Run bloom_build.py first to build the Bloom filter.")
+                sys.exit(1)
+
+        # Load metadata
+        meta = load_bloom_meta()
+        bloom_m = meta["m"]
+        bloom_k = meta["k"]
+        bloom_path = BLOOM_PATH
 
     print("=" * 60)
-    print("  Ethereum Wallet Generator + Checker")
+    if args.benchmark:
+        print("  Ethereum Wallet Generator - BENCHMARK MODE")
+    else:
+        print("  Ethereum Wallet Generator + Checker")
     print("=" * 60)
-    print(f"  Addresses in DB:   {meta['n']:,}")
-    print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB "
-          f"(FPR={meta['fpr_actual']:.4%})")
+    if args.benchmark:
+        print(f"  Duration:          {args.duration}s")
+        print(f"  Bloom filter:      {bloom_size / 1024 / 1024:.1f} MB (random, benchmark)")
+    else:
+        print(f"  Addresses in DB:   {meta['n']:,}")
+        print(f"  Bloom filter:      {os.path.getsize(BLOOM_PATH) / 1024 / 1024:.1f} MB "
+              f"(FPR={meta['fpr_actual']:.4%})")
     print(f"  Workers:           {args.workers}")
     print(f"  Batch size:        {args.batch}")
-    print(f"  Found output:      {FOUND_FILE}")
+    if not args.benchmark:
+        print(f"  Found output:      {FOUND_FILE}")
     print("=" * 60)
-    print("  Press Ctrl+C to stop")
+    if args.benchmark:
+        print(f"  Auto-stop after {args.duration}s")
+    else:
+        print("  Press Ctrl+C to stop")
     print("=" * 60)
     print()
 
@@ -210,8 +259,8 @@ def main():
     for i in range(args.workers):
         p = multiprocessing.Process(
             target=worker,
-            args=(i, BLOOM_PATH, bloom_m, bloom_k, DB_PATH,
-                  counter, found_counter, stop_event, args.batch),
+            args=(i, bloom_path, bloom_m, bloom_k, DB_PATH,
+                  counter, found_counter, stop_event, args.batch, args.benchmark),
             daemon=True
         )
         p.start()
@@ -254,6 +303,19 @@ def main():
                 print("\nAll workers have stopped!")
                 break
 
+            # Auto-stop for benchmark
+            if args.benchmark and elapsed >= args.duration:
+                print(f"\nBenchmark duration ({args.duration}s) reached.")
+                stop_event.set()
+                deadline = time.time() + 10
+                for p in workers:
+                    remaining = max(0.1, deadline - time.time())
+                    p.join(timeout=remaining)
+                for p in workers:
+                    if p.is_alive():
+                        p.terminate()
+                break
+
     except KeyboardInterrupt:
         print("\n\nStopping...")
         stop_event.set()
@@ -276,15 +338,27 @@ def main():
 
     print()
     print("=" * 60)
-    print("  SUMMARY")
+    if args.benchmark:
+        print("  BENCHMARK RESULTS (CPU)")
+    else:
+        print("  SUMMARY")
     print("=" * 60)
+    print(f"  Workers:        {args.workers}")
     print(f"  Time:           {elapsed:.1f}s")
     print(f"  Checked:        {total:,} keys")
     print(f"  Avg speed:      {total / elapsed:,.0f} keys/sec" if elapsed > 0 else "")
-    print(f"  Found:          {found}")
-    if found > 0:
-        print(f"  Results:        {FOUND_FILE}")
+    if not args.benchmark:
+        print(f"  Found:          {found}")
+        if found > 0:
+            print(f"  Results:        {FOUND_FILE}")
     print("=" * 60)
+
+    # Cleanup benchmark temp file
+    if args.benchmark:
+        try:
+            os.remove(benchmark_bloom_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

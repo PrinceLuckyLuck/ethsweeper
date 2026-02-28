@@ -120,6 +120,24 @@ python generator.py --workers 16   # custom worker count
 
 **Stop:** `Ctrl+C` (graceful shutdown).
 
+**Benchmark mode (no database required):**
+
+```bash
+# GPU benchmark — 30 seconds, default batch mode
+python gpu_generator.py --benchmark
+
+# GPU benchmark — 10 seconds, incremental mode
+python gpu_generator.py --benchmark --duration 10 --no-batch
+
+# GPU benchmark — custom parameters
+python gpu_generator.py --benchmark --global-size 65536 --keys-per-thread 512
+
+# CPU benchmark — 10 seconds, 16 workers
+python generator.py --benchmark --duration 10 --workers 16
+```
+
+Benchmark creates a random Bloom filter in memory (~470 MB) and skips SQLite entirely. No data files needed — works on any machine with the dependencies installed. Useful for measuring raw key generation speed.
+
 ### 6. Verify GPU correctness
 
 ```bash
@@ -136,6 +154,8 @@ python test_gpu_correctness.py --test batch # specific test
 | `--keys-per-thread` | 256 | Keys generated per thread per iteration |
 | `--no-batch` | off | Use incremental mode without batch inversion |
 | `--no-incremental` | off | Use legacy mode (full scalar mult) |
+| `--benchmark` | off | Benchmark mode: no DB required, random bloom in memory |
+| `--duration` | 30 | Benchmark duration in seconds |
 
 VRAM usage: Bloom (470 MB) + Seeds + Hit buffers = ~480-510 MB.
 
