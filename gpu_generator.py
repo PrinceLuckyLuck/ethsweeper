@@ -18,6 +18,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -261,11 +262,6 @@ def main():
     hit_addresses_np = np.empty(MAX_HITS * 42, dtype=np.uint8)
     hit_addresses_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=hit_addresses_np.nbytes)
 
-    # SQLite connection for bloom hit verification
-    db_conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    db_conn.execute("PRAGMA cache_size = -200000")  # ~200 MB cache
-    db_cur = db_conn.cursor()
-
     # Select kernel
     if args.no_incremental:
         kernel = program.generate_and_check
@@ -274,9 +270,66 @@ def main():
     else:
         kernel = program.generate_and_check_batch
 
+    # --- Async hit processing (background thread for SQLite verification) ---
+    # GPU launches next kernel while CPU processes bloom hits from previous iteration.
+    # SQLite is I/O-bound, so GIL is released during queries.
+    BATCH_SQL_SIZE = 500  # addresses per batch SQL query
+
+    total_found = 0
+    found_lock = threading.Lock()
+    hit_thread = None
+
+    def process_hits_batch(pk_data, addr_data, actual_hits, total_keys_snapshot):
+        """Process bloom hits in background: batch SQLite verification."""
+        nonlocal total_found
+        # Open own SQLite connection (thread-safe)
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn.execute("PRAGMA cache_size = -200000")
+        cur = conn.cursor()
+
+        # Parse addresses and privkeys
+        hits = []
+        for i in range(actual_hits):
+            addr_str = bytes(addr_data[i * 42:(i + 1) * 42]).decode('ascii', errors='replace')
+            hits.append(addr_str)
+
+        # Batch SQL: check BATCH_SQL_SIZE addresses at once
+        found_addrs = {}
+        for batch_start in range(0, len(hits), BATCH_SQL_SIZE):
+            batch = hits[batch_start:batch_start + BATCH_SQL_SIZE]
+            placeholders = ",".join("?" * len(batch))
+            cur.execute(
+                f"SELECT address, eth_balance FROM addresses WHERE address IN ({placeholders})",
+                batch
+            )
+            for row in cur.fetchall():
+                found_addrs[row[0]] = row[1]
+
+        conn.close()
+
+        # Process confirmed matches
+        if found_addrs:
+            for i in range(actual_hits):
+                addr_str = hits[i]
+                if addr_str in found_addrs:
+                    eth_balance = found_addrs[addr_str]
+                    privkey_bytes_le = bytes(pk_data[i * 32:(i + 1) * 32])
+                    privkey_bytes = privkey_bytes_le[::-1]
+                    privkey_hex = "0x" + privkey_bytes.hex()
+
+                    print(f"\n{'=' * 60}")
+                    print(f"[!!!] ADDRESS FOUND: {addr_str}")
+                    print(f"[!!!] Private key: {privkey_hex}")
+                    print(f"[!!!] ETH balance: {eth_balance}")
+                    print(f"[!!!] Attempt #: {total_keys_snapshot}")
+                    print(f"{'=' * 60}\n")
+
+                    save_found(addr_str, privkey_hex, eth_balance, total_keys_snapshot)
+                    with found_lock:
+                        total_found += 1
+
     # Stats
     total_keys = 0
-    total_found = 0
     total_bloom_hits = 0
     t0 = time.time()
     prev_keys = 0
@@ -332,38 +385,32 @@ def main():
         total_keys += keys_this_iter
         total_bloom_hits += n_hits
 
-        # 6. Process bloom hits on CPU
+        # 6. Process bloom hits: read buffers, launch async SQLite verification
         if n_hits > 0:
             actual_hits = min(n_hits, MAX_HITS)
-            # Read only the needed amount
+
+            # Read hit buffers from GPU (PCIe transfer — must finish before next kernel)
             pk_read = np.empty(MAX_HITS * 32, dtype=np.uint8)
             addr_read = np.empty(MAX_HITS * 42, dtype=np.uint8)
             cl.enqueue_copy(queue, pk_read, hit_privkeys_buf)
             cl.enqueue_copy(queue, addr_read, hit_addresses_buf)
             queue.finish()
 
-            for i in range(actual_hits):
-                privkey_bytes_le = bytes(pk_read[i * 32:(i + 1) * 32])
-                privkey_bytes = privkey_bytes_le[::-1]  # Convert LE -> BE for standard format
-                addr_str = bytes(addr_read[i * 42:(i + 1) * 42]).decode('ascii', errors='replace')
+            # Wait for previous hit processing thread to finish
+            if hit_thread is not None:
+                hit_thread.join()
 
-                # SQLite confirmation
-                db_cur.execute("SELECT eth_balance FROM addresses WHERE address = ?",
-                               (addr_str,))
-                row = db_cur.fetchone()
-                if row is not None:
-                    eth_balance = row[0]
-                    privkey_hex = "0x" + privkey_bytes.hex()
+            # Copy data for background thread (GPU buffers will be reused)
+            pk_copy = bytes(pk_read)
+            addr_copy = bytes(addr_read)
 
-                    print(f"\n{'=' * 60}")
-                    print(f"[!!!] ADDRESS FOUND: {addr_str}")
-                    print(f"[!!!] Private key: {privkey_hex}")
-                    print(f"[!!!] ETH balance: {eth_balance}")
-                    print(f"[!!!] Attempt #: {total_keys}")
-                    print(f"{'=' * 60}\n")
-
-                    save_found(addr_str, privkey_hex, eth_balance, total_keys)
-                    total_found += 1
+            # Launch async SQLite verification — GPU proceeds to next kernel
+            hit_thread = threading.Thread(
+                target=process_hits_batch,
+                args=(pk_copy, addr_copy, actual_hits, total_keys),
+                daemon=True
+            )
+            hit_thread.start()
 
         # 7. Stats (every ~5 seconds or on first iteration)
         now = time.time()
@@ -376,17 +423,21 @@ def main():
             avg_rate = total_keys / elapsed if elapsed > 0 else 0
             bloom_hit_pct = (total_bloom_hits / total_keys * 100) if total_keys > 0 else 0
 
+            with found_lock:
+                found = total_found
+
             print(f"[{elapsed:7.0f}s] Checked: {format_number(total_keys):>10s} | "
                   f"Speed: {format_number(rate):>8s} keys/sec | "
                   f"Avg: {format_number(avg_rate):>8s}/sec | "
                   f"Bloom hits: {total_bloom_hits} ({bloom_hit_pct:.3f}%) | "
-                  f"Found: {total_found}")
+                  f"Found: {found}")
 
             prev_keys = total_keys
             prev_time = now
 
-    # Shutdown
-    db_conn.close()
+    # Shutdown — wait for last hit processing
+    if hit_thread is not None:
+        hit_thread.join()
 
     elapsed = time.time() - t0
     print()
